@@ -83,8 +83,19 @@ Acceptance checks used so far:
 - **Known failure.** Inno Setup 6.1's stage-2 `.tmp` (seen with a large game installer) can die with
   `nested exception on signal stack` inside `_platform_memmove$VARIANT$Rosetta`. Ordinary 32-bit programs and
   SEH/VEH work (`demo/seh32.c`), so this isn't a general WoW64 problem.
+- **Numeric hostname.** When macOS has no HostName set, `hostname` can be a DHCP address such as `192.168.1.7`.
+  Unpatched wineboot then crashes in `create_computer_name_keys` (`_invalid_parameter`, 0xc0000417), and a new
+  prefix fails with `could not load kernel32.dll`. `patches/wine/0001` fixes this. Check with `hostname`.
 - **Fonts.** A fresh prefix has no core fonts. Some glyphs (e.g. Vietnamese capitals with stacked marks) render badly
   in the substituted Courier New; pick a font with full coverage, such as Menlo.
+- **Invisible CEF popups.** CEF apps that draw off-screen into a layered window (`UpdateLayeredWindow`) can show a
+  fully transparent window that still takes clicks. GPU compositing through ANGLE fails under both wined3d and DXVK
+  (DXVK logs `VK_KHR_EXTERNAL_MEMORY_WIN32 not supported` for shared textures). Run without `--dxvk` and add
+  `libegl,libglesv2=d` to `WINEDLLOVERRIDES`; the GPU process then fails and CEF falls back to software compositing.
+  Seen with the Truy Kích launcher, whose `LiuseLoader.exe` rejects extra CEF switches such as `--disable-gpu`.
+- **Input methods.** With a macOS input method such as Vietnamese Telex active, keystrokes can go to Wine's IME
+  composition box (a small white box, often at a window's bottom-left) instead of the text field. Switch the input
+  source to ABC.
 
 ## Conventions for changes
 

@@ -30,6 +30,8 @@ Patches in `patches/<project>/` are applied automatically, and applying them twi
 
 - `dxvk-macos/0001`: guards the `D3DDEVINFO_RESOURCEMANAGER` typedef, which mingw-w64 11 and later also define.
 - `vulkan-tools/0001`: makes vulkaninfo load user32 in mingw builds. Upstream loads it only for MSVC, so mingw builds crash.
+- `wine/0001`: stops wineboot crashing when the Mac's hostname is an IP address (macOS uses the DHCP address when
+  no HostName is set). Without it, new prefixes fail with `could not load kernel32.dll`.
 
 ## Run
 
