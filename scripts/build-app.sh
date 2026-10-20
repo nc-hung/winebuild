@@ -1,7 +1,17 @@
 #!/bin/bash
 # Builds the bottle manager (app/) and assembles dist/Winebuild Manager.app.
-# Usage: scripts/build-app.sh [--open]
+# Usage: scripts/build-app.sh [--install] [--open]
+#   --install  also copy the app to /Applications (replacing an older copy)
+#   --open     launch the app afterwards (the installed copy with --install)
 set -euo pipefail
+INSTALL=0 OPEN=0
+for arg in "$@"; do
+    case "$arg" in
+        --install) INSTALL=1 ;;
+        --open) OPEN=1 ;;
+        *) echo "usage: $0 [--install] [--open]" >&2; exit 2 ;;
+    esac
+done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APPSRC="$ROOT/app"
 OUT="$ROOT/dist/Winebuild Manager.app"
@@ -49,5 +59,14 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 PLIST
 codesign --force --sign - "$OUT" >/dev/null
 echo "Built: $OUT"
-[ "${1:-}" = "--open" ] && open "$OUT"
+
+if [ "$INSTALL" = 1 ]; then
+    DEST="/Applications/Winebuild Manager.app"
+    osascript -e 'quit app id "local.winebuild.manager"' >/dev/null 2>&1 || true
+    rm -rf "$DEST"
+    ditto "$OUT" "$DEST"
+    echo "Installed: $DEST"
+    OUT="$DEST"
+fi
+[ "$OPEN" = 1 ] && open "$OUT"
 exit 0

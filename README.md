@@ -51,7 +51,10 @@ DXVK is enabled for each run separately, through `WINEDLLOVERRIDES`; a prefix us
 ## App
 
 `scripts/build-app.sh --open` builds and opens **Winebuild Manager** (`dist/Winebuild Manager.app`), a
-CrossOver-style manager for the prefixes in `prefixes/`:
+CrossOver-style manager for the prefixes in `prefixes/`. Add `--install` to copy it into `/Applications` so it shows up
+in Launchpad and Spotlight; rerun with `--install` after changes to update that copy.
+
+What it does:
 
 - create bottles, run installers (or drag a file onto the window), and launch installed programs from an icon grid;
 - pin programs that have no Start-menu shortcut, such as game launchers;

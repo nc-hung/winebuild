@@ -84,7 +84,7 @@ Acceptance checks used so far:
 
 ```bash
 cd app && swift test        # WineKit unit tests (Swift Testing)
-scripts/build-app.sh        # -> dist/Winebuild Manager.app (ad-hoc signed); --open to launch it
+scripts/build-app.sh        # -> dist/Winebuild Manager.app (ad-hoc signed); --install copies it to /Applications, --open launches it
 ```
 
 ## Gotchas (learned the hard way)
