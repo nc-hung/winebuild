@@ -5,6 +5,7 @@
 /deps/
 /logs/
 /prefixes/
+/downloads/
 
 # Built test programs and caches
 /demo/*.exe
