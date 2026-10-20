@@ -29,9 +29,11 @@ Tracked in git:
 | `scripts/wrun` | Launcher; the only supported way to run Wine (see below). |
 | `patches/<project>/NNNN-*.patch` | Applied by `wb_apply_patches`; must be safe to apply twice. |
 | `demo/*.c` | Small Windows test programs (compiled `.exe` files are ignored). |
+| `app/` | Winebuild Manager, a SwiftUI bottle manager (SwiftPM package; see below). |
+| `scripts/build-app.sh` | Builds `dist/Winebuild Manager.app` from `app/`. |
 
 Generated and gitignored (never commit): `src/`, `build/`, `dist/`, `deps/`, `logs/`, `prefixes/`, `downloads/`,
-`demo/*.exe`, `*.dxvk-cache`.
+`demo/*.exe`, `*.dxvk-cache`, `app/.build/`.
 
 ## Build
 
@@ -63,6 +65,27 @@ Acceptance checks used so far:
 - winecfg and notepad open.
 - vulkaninfo lists the Apple GPU.
 - d3d11tri reports the Apple adapter and shows the DXVK HUD.
+
+## Winebuild Manager app
+
+`app/` is a SwiftPM package (Swift 6 toolchain, language mode 5, macOS 14+). UI strings are Vietnamese.
+
+- `WineKit` (library, no UI): `Bottle`/`BottleStore` (each folder in `prefixes/` is a bottle),
+  `BottleConfig` (stored in `<prefix>/.winebuild/bottle.json`), `WineLauncher` (builds `wrun` command lines),
+  `AppScanner` (Start-menu `.lnk` files via `ShellLink`, plus pinned exes), `PEIcon` (icons from PE resources),
+  `RegistryFile` (reads `user.reg`/`system.reg`).
+- `WinebuildManager` (executable): the SwiftUI app. Every Wine process goes through `scripts/wrun`; logs go to
+  `<prefix>/.winebuild/logs/`.
+- Settings that Wine reads from the registry (Windows version, Retina, DLL overrides) are written with
+  `wine reg add/delete`, so they also apply to plain `wrun` runs. Graphics mode, DXVK HUD, extra environment
+  variables and pinned apps live only in `bottle.json` and become `wrun` flags/env when the app launches a program.
+- The app finds the repo from the `WinebuildRoot` key that `build-app.sh` writes into Info.plist, falling back to
+  `~/winebuild`; Preferences (⌘,) can override it.
+
+```bash
+cd app && swift test        # WineKit unit tests (Swift Testing)
+scripts/build-app.sh        # -> dist/Winebuild Manager.app (ad-hoc signed); --open to launch it
+```
 
 ## Gotchas (learned the hard way)
 

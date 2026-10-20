@@ -48,6 +48,19 @@ scripts/wrun shell                                  # shell with the Wine enviro
 
 DXVK is enabled for each run separately, through `WINEDLLOVERRIDES`; a prefix uses wined3d unless you pass `--dxvk`.
 
+## App
+
+`scripts/build-app.sh --open` builds and opens **Winebuild Manager** (`dist/Winebuild Manager.app`), a
+CrossOver-style manager for the prefixes in `prefixes/`:
+
+- create bottles, run installers (or drag a file onto the window), and launch installed programs from an icon grid;
+- pin programs that have no Start-menu shortcut, such as game launchers;
+- per bottle: WineD3D or DXVK, DXVK HUD, Windows version, Retina mode, DLL overrides (with a preset for blank CEF
+  launchers), environment variables;
+- winecfg, regedit, taskmgr and the other Wine tools, plus a log viewer for every program started from the app.
+
+It runs everything through `scripts/wrun`. App settings are saved in `<prefix>/.winebuild/bottle.json`.
+
 ## Checks
 
 - `scripts/wrun demo/vulkaninfo.exe --summary` should list the Apple GPU with `DRIVER_ID_MOLTENVK`.
