@@ -1,0 +1,15 @@
+# Build trees, sources and outputs are reproducible from scripts/ + versions.env.
+/src/
+/build/
+/dist/
+/deps/
+/logs/
+/prefixes/
+/downloads/
+
+# Built test programs and caches
+/demo/*.exe
+/demo/*.dxvk-cache
+*.dxvk-cache
+*.log
+.DS_Store

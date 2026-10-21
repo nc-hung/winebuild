@@ -1,0 +1,745 @@
+winemac.drv: Give a child of another process's window its own Mac window.
+
+A window that is SetParent'ed into a window of another process (Adobe AIR's
+ApolloRuntimeContentWindow inside a launcher's main window) can't draw into its
+parent's surface, and winemac destroyed its Mac window, so nothing showed.
+
+Such a window now keeps its own window surface (win32u) and a borderless Mac
+window (winemac), placed at its screen position and ordered just above the Mac
+window of its top-level ancestor. The parent process publishes that Mac window's
+number in a window property and posts WM_MACDRV_SYNC_FOREIGN_CHILD to foreign
+descendants when it moves, is reordered or hidden, or when its app is activated.
+
+GL/Vulkan client surfaces (wined3d, so also D3D9 in AIR) and mouse capture use
+get_cocoa_toplevel() instead of GA_ROOT: the topmost ancestor in this process,
+which owns the Mac window. With GA_ROOT the client view was never attached and
+the child stayed white.
+
+A window can also have several GL drawables: win32u makes one per context made
+current on it, and wined3d in AIR makes two. Each new drawable showed its own
+view and hid the previous one, so frames swapped into the first went to a
+hidden view and the window stayed white. The drawable that swaps now shows its
+view (macdrv_client_surface_show). This part also affects ordinary windows.
+
+Mouse input is sent naming the window that owns the Mac window
+(get_cocoa_toplevel) instead of GA_ROOT. The server makes the named window the
+cursor window and asks its thread to set the cursor; with GA_ROOT that was the
+other process, which set its own cursor (often none), so the pointer vanished
+over the child.
+
+A process whose Mac windows are all such children (AIR's lobby process) becomes
+an accessory app instead of a regular one, so it adds no Dock icon or menu bar
+but can still be activated and take keyboard focus. Showing an ordinary window
+later still makes it a regular app, and it goes back to being an accessory app
+once only such children are shown. AIR's preloader shows an ordinary window
+before its lobby window is reparented, and keeps a zero-size window, which
+doesn't make an accessory app regular. A regular process that is left with no
+window shown at all (a launcher that hides itself after starting the game, or
+explorer.exe) becomes an accessory app too, after 2 seconds so that going from
+one window to the next doesn't make its Dock icon flicker.
+
+Test: scripts/test-xproc-child.sh (demo/xprocchild.c).
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 4bceb90..16a9f1f 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2073,7 +2073,7 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
+ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
+                                                   struct window_rects *rects, RECT *surface_rect )
+ {
+-    BOOL shaped, needs_surface, create_opaque, is_layered, is_child;
++    BOOL shaped, needs_surface, create_opaque, is_layered, is_child, foreign_child;
+     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+     struct window_surface *new_surface;
+     struct window_rects monitor_rects;
+@@ -2084,6 +2084,8 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+     is_child = parent && parent != NtUserGetDesktopWindow();
++    /* a child of another process's window can't draw into its parent's surface, it needs its own */
++    foreign_child = is_child && !is_current_process_window( parent );
+ 
+     if (is_child) get_win_monitor_dpi( parent, &raw_dpi );
+     else monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
+@@ -2096,7 +2098,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
+     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
+ 
+     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
+-    else if (is_child) needs_surface = FALSE;
++    else if (is_child && !foreign_child) needs_surface = FALSE;
+     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
+     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
+     else needs_surface = !!(style & WS_VISIBLE);
+diff --git a/dlls/winemac.drv/cocoa_app.h b/dlls/winemac.drv/cocoa_app.h
+index 85d252a..793f81c 100644
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -103,6 +103,8 @@ @interface WineApplicationController : NSObject <NSApplicationDelegate>
+     + (WineApplicationController*) sharedController;
+ 
+     - (void) transformProcessToForeground:(BOOL)activateIfTransformed;
++    - (void) transformProcessToAccessory;
++    - (void) transformProcessToAccessoryIfNothingShown;
+     - (void) tryToActivateIgnoringOtherApps:(BOOL)ignore;
+ 
+     - (BOOL) registerEventQueue:(WineEventQueue*)queue;
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 2a9dab2..5aa0097 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -220,6 +220,18 @@ - (void) dealloc
+         [super dealloc];
+     }
+ 
++    - (void) disableAppNap
++    {
++        static BOOL disabled;
++
++        if (!enable_app_nap && !disabled)
++        {
++            [[[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
++                                                            reason:@"Running Windows program"] retain]; // intentional leak
++            disabled = TRUE;
++        }
++    }
++
+     - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+     {
+         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
+@@ -235,11 +247,7 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             if (activateIfTransformed)
+                 [self tryToActivateIgnoringOtherApps:YES];
+ 
+-            if (!enable_app_nap)
+-            {
+-                [[[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+-                                                                reason:@"Running Windows program"] retain]; // intentional leak
+-            }
++            [self disableAppNap];
+ 
+             mainMenu = [[[NSMenu alloc] init] autorelease];
+ 
+@@ -305,6 +313,73 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+         }
+     }
+ 
++    /* Whether any window other than a child of another process's window is
++       shown with something to see, or is minimized to the Dock. */
++    - (BOOL) showsOrdinaryWindow
++    {
++        for (WineWindow* window in [NSApp windows])
++        {
++            if (![window isKindOfClass:[WineWindow class]] || window.foreignChild)
++                continue;
++            if ([window isMiniaturized] || ([window isOrderedIn] && [window presentsVisibleContent]))
++                return TRUE;
++        }
++        return FALSE;
++    }
++
++    /* For a process whose only windows are children of another process's
++       windows (shown on screen through their own Mac windows): it can own
++       windows and be activated, but gets no Dock icon or menu bar.  A later
++       ordinary window still makes it a regular app, and it goes back to
++       being an accessory app when only such children are left (AIR's
++       preloader shows an ordinary window first, and keeps a zero-size one). */
++    - (void) transformProcessToAccessory
++    {
++        NSApplicationActivationPolicy policy = [NSApp activationPolicy];
++
++        if (policy == NSApplicationActivationPolicyProhibited)
++        {
++            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++            [self disableAppNap];
++        }
++        else if (policy == NSApplicationActivationPolicyRegular && ![self showsOrdinaryWindow])
++            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++    }
++
++    /* Called when a window is ordered out or becomes such a child.  A
++       process left with no window to show at all (a launcher that hides
++       itself after starting another program) also goes back to being an
++       accessory app, after a short delay so that going from one window to
++       the next doesn't make its Dock icon flicker. */
++    - (void) transformProcessToAccessoryIfNothingShown
++    {
++        if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular || [self showsOrdinaryWindow])
++            return;
++
++        for (WineWindow* window in [NSApp windows])
++        {
++            if ([window isKindOfClass:[WineWindow class]] && window.foreignChild && [window isOrderedIn])
++            {
++                [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++                return;
++            }
++        }
++
++        [NSObject cancelPreviousPerformRequestsWithTarget:self
++                                                 selector:@selector(transformProcessToAccessoryIfStillNothingShown)
++                                                   object:nil];
++        [self performSelector:@selector(transformProcessToAccessoryIfStillNothingShown)
++                   withObject:nil
++                   afterDelay:2
++                      inModes:@[NSRunLoopCommonModes]];
++    }
++
++    - (void) transformProcessToAccessoryIfStillNothingShown
++    {
++        if ([NSApp activationPolicy] == NSApplicationActivationPolicyRegular && ![self showsOrdinaryWindow])
++            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++    }
++
+     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents
+     {
+         PerformRequest(NULL);
+diff --git a/dlls/winemac.drv/cocoa_window.h b/dlls/winemac.drv/cocoa_window.h
+index 23ecd6d..37f70e8 100644
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -90,6 +90,8 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+ @property (readonly, nonatomic) BOOL disabled;
+ @property (readonly, nonatomic) BOOL noForeground;
+ @property (readonly, nonatomic) BOOL preventsAppActivation;
++/* child of another process's window: its Mac window doesn't need a Dock icon */
++@property (readonly, nonatomic) BOOL foreignChild;
+ @property (readonly, nonatomic) BOOL floating;
+ @property (readonly, getter=isFullscreen, nonatomic) BOOL fullscreen;
+ @property (readonly, getter=isFakingClose, nonatomic) BOOL fakingClose;
+@@ -100,6 +102,8 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+    shaped, or has a child window that meets those criteria. */
+ @property (readonly, nonatomic) BOOL presentsVisibleContent;
+ 
++    - (BOOL) isOrderedIn;
++
+     - (NSInteger) minimumLevelForActive:(BOOL)active;
+     - (void) updateFullscreen;
+ 
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 7d6d704..642a170 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -395,6 +395,7 @@ @interface WineWindow ()
+ @property (readwrite, nonatomic) BOOL disabled;
+ @property (readwrite, nonatomic) BOOL noForeground;
+ @property (readwrite, nonatomic) BOOL preventsAppActivation;
++@property (readwrite, nonatomic) BOOL foreignChild;
+ @property (readwrite, nonatomic) BOOL floating;
+ @property (readwrite, nonatomic) BOOL drawnSinceShown;
+ @property (readwrite, nonatomic) BOOL closing;
+@@ -1000,7 +1001,7 @@ @implementation WineWindow
+ 
+     static WineWindow* causing_becomeKeyWindow;
+ 
+-    @synthesize disabled, noForeground, preventsAppActivation, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
++    @synthesize disabled, noForeground, preventsAppActivation, foreignChild, floating, fullscreen, fakingClose, closing, latentParentWindow, hwnd, queue;
+     @synthesize drawnSinceShown;
+     @synthesize shapeChangedSinceLastDraw;
+     @synthesize usePerPixelAlpha;
+@@ -1298,6 +1299,12 @@ - (void) setMacDrvState:(const struct macdrv_window_state*)state
+ 
+         self.disabled = state->disabled;
+         self.noForeground = state->no_foreground;
++        if (self.foreignChild != state->foreign_child)
++        {
++            self.foreignChild = state->foreign_child;
++            if (self.foreignChild && [self isOrderedIn])
++                [[WineApplicationController sharedController] transformProcessToAccessoryIfNothingShown];
++        }
+ 
+         if (self.floating != state->floating)
+         {
+@@ -1737,7 +1744,11 @@ - (void) orderBelow:(WineWindow*)prev orAbove:(WineWindow*)next activate:(BOOL)a
+             WineWindow* parent;
+             WineWindow* child;
+ 
+-            [controller transformProcessToForeground:!self.preventsAppActivation];
++            if (self.foreignChild)
++                [controller transformProcessToAccessory];
++            else if ([NSApp activationPolicy] != NSApplicationActivationPolicyAccessory ||
++                     [self presentsVisibleContent])
++                [controller transformProcessToForeground:!self.preventsAppActivation];
+             if ([NSApp isHidden])
+                 [NSApp unhide:nil];
+             wasVisible = [self isVisible];
+@@ -1897,6 +1908,7 @@ - (void) doOrderOut
+             [controller updateFullscreenWindows];
+         [controller adjustWindowLevels];
+         [NSApp removeWindowsItem:self];
++        [controller transformProcessToAccessoryIfNothingShown];
+ 
+         [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
+                                          event_mask_for_type(WINDOW_GOT_FOCUS) |
+@@ -2109,7 +2121,11 @@ - (void) makeFocused:(BOOL)activate
+         if (activate)
+         {
+             WineApplicationController *controller = [WineApplicationController sharedController];
+-            [controller transformProcessToForeground:YES];
++            if (self.foreignChild)
++                [controller transformProcessToAccessory];
++            else if ([NSApp activationPolicy] != NSApplicationActivationPolicyAccessory ||
++                     [self presentsVisibleContent])
++                [controller transformProcessToForeground:YES];
+             [controller tryToActivateIgnoringOtherApps:YES];
+         }
+ 
+@@ -3496,6 +3512,40 @@ void macdrv_order_cocoa_window(macdrv_window w, macdrv_window p,
+                                 forWindow:next];
+ }
+ 
++/***********************************************************************
++ *              macdrv_get_cocoa_window_number
++ *
++ * Returns the window server number of a Cocoa window, or 0 if it has
++ * none yet (deferred windows get one when first ordered in).
++ */
++int macdrv_get_cocoa_window_number(macdrv_window w)
++{
++    WineWindow* window = (WineWindow*)w;
++    __block NSInteger number;
++
++    OnMainThread(^{
++        number = [window windowNumber];
++    });
++    return number > 0 ? (int)number : 0;
++}
++
++/***********************************************************************
++ *              macdrv_order_cocoa_window_above_number
++ *
++ * Order an on-screen Cocoa window just above a window given by its
++ * window server number, which may belong to another process.  Used for
++ * Wine child windows whose parent lives in another process.
++ */
++void macdrv_order_cocoa_window_above_number(macdrv_window w, int number)
++{
++    WineWindow* window = (WineWindow*)w;
++
++    OnMainThreadAsync(^{
++        if ([window isVisible] && ![window isMiniaturized])
++            [window orderWindow:NSWindowAbove relativeTo:number];
++    });
++}
++
+ /***********************************************************************
+  *              macdrv_hide_cocoa_window
+  *
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index ac2a785..8471690 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -97,6 +97,7 @@ static inline RECT rect_from_cgrect(CGRect cgrect)
+ {
+     WM_MACDRV_SET_WIN_REGION = WM_WINE_FIRST_DRIVER_MSG,
+     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
++    WM_MACDRV_SYNC_FOREIGN_CHILD,
+ };
+ 
+ struct macdrv_thread_data
+@@ -189,6 +190,7 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
+     unsigned int        minimized : 1;          /* is window minimized? */
+     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
++    unsigned int        foreign_parent : 1;     /* child of another process's window, with its own Mac window */
+ };
+ 
+ struct macdrv_client_surface
+@@ -205,6 +207,8 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+ }
+ 
+ extern struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd);
++extern HWND get_cocoa_toplevel(HWND hwnd);
++extern void macdrv_client_surface_show(struct client_surface *client);
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 6a6b697..750e1fb 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -487,6 +487,7 @@ extern int macdrv_register_hot_key(macdrv_event_queue q, unsigned int vkey, unsi
+     unsigned int    minimized:1;
+     unsigned int    minimized_valid:1;
+     unsigned int    maximized:1;
++    unsigned int    foreign_child:1;
+ };
+ 
+ struct window_surface;
+@@ -504,6 +505,8 @@ extern void macdrv_set_cocoa_window_title(macdrv_window w, const UniChar* title,
+ extern void macdrv_order_cocoa_window(macdrv_window w, macdrv_window prev,
+         macdrv_window next, bool activate);
+ extern void macdrv_hide_cocoa_window(macdrv_window w);
++extern int macdrv_get_cocoa_window_number(macdrv_window w);
++extern void macdrv_order_cocoa_window_above_number(macdrv_window w, int number);
+ extern void macdrv_set_cocoa_window_frame(macdrv_window w, const CGRect* new_frame);
+ extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
+ extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
+diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
+index c655f56..6c8fa29 100644
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -158,7 +158,11 @@ static void send_mouse_input(HWND hwnd, macdrv_window cocoa_window, UINT flags,
+     input.mi.time           = time;
+     input.mi.dwExtraInfo    = 0;
+ 
+-    NtUserSendHardwareInput(top_level_hwnd, 0, &input, 0);
++    /* Name the window that owns the Mac window, not GA_ROOT: for a child of
++     * another process's window, the server makes the named window the
++     * cursor window and asks its thread to set the cursor, and only this
++     * process can show a cursor over its Mac window. */
++    NtUserSendHardwareInput(get_cocoa_toplevel(hwnd), 0, &input, 0);
+ }
+ 
+ 
+@@ -707,7 +711,7 @@ BOOL macdrv_GetCursorPos(LPPOINT pos)
+  void macdrv_SetCapture(HWND hwnd, UINT flags)
+ {
+     struct macdrv_thread_data *thread_data = macdrv_thread_data();
+-    HWND top = NtUserGetAncestor(hwnd, GA_ROOT);
++    HWND top = get_cocoa_toplevel(hwnd);
+     macdrv_window cocoa_window = macdrv_get_cocoa_window(top, FALSE);
+ 
+     TRACE("hwnd %p top %p/%p flags 0x%08x\n", hwnd, top, cocoa_window, flags);
+@@ -950,7 +954,7 @@ void macdrv_release_capture(HWND hwnd, const macdrv_event *event)
+ {
+     struct macdrv_thread_data *thread_data = macdrv_thread_data();
+     HWND capture = get_capture();
+-    HWND capture_top = NtUserGetAncestor(capture, GA_ROOT);
++    HWND capture_top = capture ? get_cocoa_toplevel(capture) : 0;
+ 
+     TRACE("win %p/%p thread_data->capture_window %p GetCapture() %p in %p\n", hwnd,
+           event->window, thread_data->capture_window, capture, capture_top);
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index e60fc04..e008100 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -2760,6 +2760,7 @@ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
+     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
+           (context ? context->cglcontext : NULL));
+ 
++    macdrv_client_surface_show(base->client);
+     macdrv_flush_opengl_context(context->context);
+     return TRUE;
+ }
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 9420e17..6d1e575 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -45,6 +45,10 @@ static CFMutableDictionaryRef win_datas;
+ 
+ static unsigned int activate_on_focus_time;
+ 
++/* Mac window number of a top-level window, so that child windows of other processes can be ordered above it */
++static const WCHAR mac_window_number_prop[] =
++    {'_','_','w','i','n','e','_','m','a','c','_','w','i','n','d','o','w','_','n','u','m','b','e','r',0};
++
+ 
+ /* per-monitor DPI aware NtUserSetWindowPos call */
+ static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
+@@ -132,6 +136,7 @@ static void get_cocoa_window_state(struct macdrv_win_data *data,
+          (NtUserGetWindowRelative(data->hwnd, GW_OWNER) || (ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE))));
+     if (IsRectEmpty(&data->rects.window))
+         state->excluded_by_expose = TRUE;
++    if (data->foreign_parent) state->excluded_by_cycle = state->foreign_child = TRUE;
+     state->minimized = (style & WS_MINIMIZE) != 0;
+     state->minimized_valid = state->minimized != data->minimized;
+     state->maximized = (style & WS_MAXIMIZE) != 0;
+@@ -231,6 +236,112 @@ macdrv_window macdrv_get_cocoa_window(HWND hwnd, BOOL require_on_screen)
+ }
+ 
+ 
++/***********************************************************************
++ *              is_foreign_window
++ *
++ * Whether a window belongs to another process.
++ */
++static BOOL is_foreign_window(HWND hwnd)
++{
++    DWORD pid = 0;
++
++    return NtUserGetWindowThread(hwnd, &pid) && pid != GetCurrentProcessId();
++}
++
++
++/***********************************************************************
++ *              get_cocoa_toplevel
++ *
++ * Return the ancestor of a window that owns its Mac window: the root
++ * window, or for a window inside another process's window, the topmost
++ * ancestor that still belongs to this process.
++ */
++HWND get_cocoa_toplevel(HWND hwnd)
++{
++    HWND parent, top = hwnd, desktop = NtUserGetDesktopWindow();
++
++    while ((parent = NtUserGetAncestor(top, GA_PARENT)) && parent != desktop && !is_foreign_window(parent))
++        top = parent;
++    return top;
++}
++
++
++/***********************************************************************
++ *              get_cocoa_frame
++ *
++ * Return the frame of the Mac window in screen coordinates.  A child of
++ * another process's window keeps its rects relative to the parent's
++ * client area, so map them to the screen.
++ */
++static CGRect get_cocoa_frame(struct macdrv_win_data *data)
++{
++    RECT rect = data->rects.visible;
++
++    if (data->foreign_parent)
++    {
++        HWND parent = NtUserGetAncestor(data->hwnd, GA_PARENT);
++        NtUserMapWindowPoints(parent, 0, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(parent, MDT_RAW_DPI));
++    }
++    return cgrect_from_rect(rect);
++}
++
++
++/***********************************************************************
++ *              order_above_foreign_parent
++ *
++ * Order the Mac window of a child of another process's window just
++ * above the Mac window of its top-level ancestor.  number is that Mac
++ * window's number, or 0 to look it up.
++ */
++static void order_above_foreign_parent(struct macdrv_win_data *data, int number)
++{
++    if (!data->cocoa_window || !data->on_screen) return;
++    if (!number)
++        number = (UINT_PTR)NtUserGetProp(NtUserGetAncestor(data->hwnd, GA_ROOT), mac_window_number_prop);
++    TRACE("win %p/%p above Mac window %d\n", data->hwnd, data->cocoa_window, number);
++    if (number) macdrv_order_cocoa_window_above_number(data->cocoa_window, number);
++}
++
++
++/***********************************************************************
++ *              sync_foreign_children
++ *
++ * Tell windows of other processes that are descendants of hwnd, and so
++ * have their own Mac windows, to follow hwnd's position and Z-order.
++ */
++static void sync_foreign_children(HWND hwnd, int number)
++{
++    HWND child;
++
++    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
++         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
++    {
++        if (is_foreign_window(child))
++            NtUserPostMessage(child, WM_MACDRV_SYNC_FOREIGN_CHILD, number, 0);
++        else
++            sync_foreign_children(child, number);
++    }
++}
++
++
++/***********************************************************************
++ *              sync_all_foreign_children
++ *
++ * Call sync_foreign_children for all top-level windows of this process.
++ */
++static void sync_all_foreign_children(void)
++{
++    HWND hwnd;
++
++    for (hwnd = NtUserGetWindowRelative(NtUserGetDesktopWindow(), GW_CHILD); hwnd;
++         hwnd = NtUserGetWindowRelative(hwnd, GW_HWNDNEXT))
++    {
++        if (!is_foreign_window(hwnd))
++            sync_foreign_children(hwnd, (UINT_PTR)NtUserGetProp(hwnd, mac_window_number_prop));
++    }
++}
++
++
+ /***********************************************************************
+  *              set_cocoa_window_properties
+  *
+@@ -474,7 +585,7 @@ static void create_cocoa_window(struct macdrv_win_data *data)
+ 
+     wf = get_cocoa_window_features(data, style, ex_style);
+ 
+-    frame = cgrect_from_rect(data->rects.visible);
++    frame = get_cocoa_frame(data);
+     constrain_window_frame(&frame.origin, &frame.size);
+     if (frame.size.width < 1 || frame.size.height < 1)
+         frame.size.width = frame.size.height = 1;
+@@ -517,6 +628,7 @@ static void destroy_cocoa_window(struct macdrv_win_data *data)
+     macdrv_destroy_cocoa_window(data->cocoa_window);
+     data->cocoa_window = 0;
+     data->on_screen = FALSE;
++    NtUserRemoveProp(data->hwnd, mac_window_number_prop);
+ }
+ 
+ 
+@@ -541,7 +653,8 @@ static struct macdrv_win_data *macdrv_create_win_data(HWND hwnd, const struct wi
+     if (!(data = alloc_win_data(hwnd))) return NULL;
+     data->rects = *rects;
+ 
+-    if (parent == NtUserGetDesktopWindow())
++    /* a child of another process's window can't be drawn by its parent, so it gets its own Mac window */
++    if (parent == NtUserGetDesktopWindow() || (data->foreign_parent = is_foreign_window(parent)))
+     {
+         create_cocoa_window(data);
+         TRACE("win %p/%p window %s whole %s client %s\n",
+@@ -656,6 +769,15 @@ static void show_window(struct macdrv_win_data *data)
+     macdrv_order_cocoa_window(data->cocoa_window, prev_window, next_window, activate);
+     data->on_screen = TRUE;
+ 
++    if (data->foreign_parent)
++        order_above_foreign_parent(data, 0);
++    else if (!NtUserGetProp(data->hwnd, mac_window_number_prop))
++    {
++        /* the number is assigned when the window is first ordered in */
++        int number = macdrv_get_cocoa_window_number(data->cocoa_window);
++        if (number) NtUserSetProp(data->hwnd, mac_window_number_prop, (HANDLE)(UINT_PTR)number);
++    }
++
+     info.cbSize = sizeof(info);
+     if (NtUserGetGUIThreadInfo(NtUserGetWindowThread(data->hwnd, NULL), &info) && info.hwndFocus &&
+         (data->hwnd == info.hwndFocus || NtUserIsChild(data->hwnd, info.hwndFocus)))
+@@ -752,7 +874,7 @@ RGNDATA *get_region_data(HRGN hrgn, HDC hdc_lptodp)
+  */
+ static void sync_window_position(struct macdrv_win_data *data, UINT swp_flags, const struct window_rects *old_rects)
+ {
+-    CGRect frame = cgrect_from_rect(data->rects.visible);
++    CGRect frame = get_cocoa_frame(data);
+ 
+     if (data->cocoa_window)
+     {
+@@ -1104,7 +1226,7 @@ static void macdrv_client_surface_detach(struct client_surface *client)
+ static void macdrv_client_surface_update(struct client_surface *client)
+ {
+     struct macdrv_client_surface *surface = impl_from_client_surface(client);
+-    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++    HWND hwnd = client->hwnd, toplevel = get_cocoa_toplevel(hwnd);
+     struct macdrv_win_data *data;
+     RECT rect;
+ 
+@@ -1120,13 +1242,19 @@ static void macdrv_client_surface_update(struct client_surface *client)
+     release_win_data(data);
+ }
+ 
+-static void macdrv_client_surface_present(struct client_surface *client, HDC hdc)
++/***********************************************************************
++ *              macdrv_client_surface_show
++ *
++ * Make a client surface's view the one shown for its window. A window can
++ * have several GL drawables (win32u makes one per context made current on
++ * it), and each hides the previous one when created, so the drawable that
++ * swaps must show itself or its frames go to a hidden view.
++ */
++void macdrv_client_surface_show(struct client_surface *client)
+ {
+     struct macdrv_client_surface *surface = impl_from_client_surface(client);
+     struct macdrv_win_data *data;
+ 
+-    TRACE("%s\n", debugstr_client_surface(client));
+-
+     if (!(data = get_win_data(surface->client.hwnd))) return;
+     if (data->client_view != surface->cocoa_view)
+     {
+@@ -1137,6 +1265,12 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
+     release_win_data(data);
+ }
+ 
++static void macdrv_client_surface_present(struct client_surface *client, HDC hdc)
++{
++    TRACE("%s\n", debugstr_client_surface(client));
++    macdrv_client_surface_show(client);
++}
++
+ static const struct client_surface_funcs macdrv_client_surface_funcs =
+ {
+     .destroy = macdrv_client_surface_destroy,
+@@ -1147,7 +1281,7 @@ static const struct client_surface_funcs macdrv_client_surface_funcs =
+ 
+ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
+ {
+-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++    HWND toplevel = get_cocoa_toplevel(hwnd);
+     struct macdrv_client_surface *surface;
+     RECT rect;
+ 
+@@ -1315,7 +1449,14 @@ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
+ 
+     if (parent != NtUserGetDesktopWindow()) /* a child window */
+     {
+-        if (old_parent == NtUserGetDesktopWindow())
++        /* a child of another process's window keeps (or gets) its own Mac window */
++        data->foreign_parent = is_foreign_window(parent);
++        if (data->foreign_parent)
++        {
++            if (!data->cocoa_window) create_cocoa_window(data);
++            else NtUserRemoveProp(hwnd, mac_window_number_prop);
++        }
++        else if (data->cocoa_window)
+         {
+             /* destroy the old Mac window */
+             destroy_cocoa_window(data);
+@@ -1323,7 +1464,8 @@ void macdrv_SetParent(HWND hwnd, HWND parent, HWND old_parent)
+     }
+     else  /* new top level window */
+     {
+-        create_cocoa_window(data);
++        data->foreign_parent = FALSE;
++        if (!data->cocoa_window) create_cocoa_window(data);
+     }
+     release_win_data(data);
+ }
+@@ -1530,6 +1672,22 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         activate_on_following_focus();
+         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
+         return 0;
++    case WM_MACDRV_SYNC_FOREIGN_CHILD:
++        /* our parent, in another process, moved or was reordered */
++        if ((data = get_win_data(hwnd)))
++        {
++            if (data->cocoa_window && data->foreign_parent)
++            {
++                BOOL visible = NtUserIsWindowVisible(hwnd);
++
++                if (data->on_screen && !visible) hide_window(data);
++                sync_window_position(data, SWP_NOZORDER, NULL);
++                if (!data->on_screen && visible) show_window(data);
++                else order_above_foreign_parent(data, wp);
++            }
++            release_win_data(data);
++        }
++        return 0;
+     }
+ 
+     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
+@@ -1644,6 +1802,10 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+ 
+ done:
+     release_win_data(data);
++
++    if ((swp_flags & (SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)) != (SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER) ||
++        (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)))
++        sync_foreign_children(hwnd, (UINT_PTR)NtUserGetProp(NtUserGetAncestor(hwnd, GA_ROOT), mac_window_number_prop));
+ }
+ 
+ 
+@@ -1693,7 +1855,8 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
+ 
+     if (!hwnd) return;
+     if (!(data = get_win_data(hwnd))) return;
+-    if (!data->on_screen || data->minimized)
++    /* the Mac window of a child of another process's window only follows the Wine one */
++    if (!data->on_screen || data->minimized || data->foreign_parent)
+     {
+         release_win_data(data);
+         return;
+@@ -1797,6 +1960,8 @@ void macdrv_app_activated(void)
+ {
+     TRACE("\n");
+     macdrv_UpdateClipboard();
++    /* activation brought our windows forward, over Mac windows of other processes' child windows */
++    sync_all_foreign_children();
+ }
+ 
+ 

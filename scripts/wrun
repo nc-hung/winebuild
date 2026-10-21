@@ -1,0 +1,98 @@
+#!/bin/bash
+# wrun — run Windows programs with the ~/winebuild Wine + MoltenVK + DXVK-macOS stack.
+#
+#   wrun [-p PREFIX] [--dxvk] [--hud SPEC] [--] PROGRAM [ARGS...]
+#   wrun [-p PREFIX] init            create/update the prefix (wineboot -u)
+#   wrun [-p PREFIX] dxvk-install    copy DXVK dlls into the prefix (done automatically by --dxvk)
+#   wrun [-p PREFIX] fonts-install   link macOS's Arial, Tahoma, Times New Roman, ... into C:\windows\Fonts
+#   wrun [-p PREFIX] shell           open a shell with the Wine environment set
+#
+#   -p, --prefix DIR  WINEPREFIX (default: $WRUN_PREFIX or ~/winebuild/prefixes/default)
+#   --dxvk            use DXVK for d3d9/d3d10/d3d11/dxgi (otherwise Wine's wined3d)
+#   --hud SPEC        set DXVK_HUD (implies --dxvk), e.g. devinfo,fps
+#   -v                keep Wine's default debug output (WINEDEBUG not silenced)
+#
+# Examples:
+#   wrun init
+#   wrun winecfg
+#   wrun --dxvk --hud devinfo,fps ~/winebuild/demo/d3d11tri.exe 15
+set -euo pipefail
+
+WB_ROOT="${WB_ROOT:-$HOME/winebuild}"
+WINE_DIST="$WB_ROOT/dist/wine"
+DXVK_DIST="$WB_ROOT/dist/dxvk"
+DXVK_DLLS="dxgi d3d9 d3d10core d3d11"
+
+prefix="${WRUN_PREFIX:-$WB_ROOT/prefixes/default}"
+use_dxvk=0
+verbose=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--prefix) prefix="$2"; shift 2 ;;
+        --dxvk) use_dxvk=1; shift ;;
+        --hud) use_dxvk=1; export DXVK_HUD="$2"; shift 2 ;;
+        -v) verbose=1; shift ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ -x "$WINE_DIST/bin/wine" ] || { echo "wrun: $WINE_DIST/bin/wine not found; run build-wine.sh" >&2; exit 1; }
+
+export WINEPREFIX="$prefix"
+export PATH="$WINE_DIST/bin:$PATH"
+# MoltenVK sits in dist/wine/lib; x86_64 freetype/gnutls/SDL2 in deps/x86_64/lib.
+# Setting this replaces dyld's defaults, so keep /usr/local/lib and /usr/lib in the list.
+export DYLD_FALLBACK_LIBRARY_PATH="$WINE_DIST/lib:$WB_ROOT/deps/x86_64/lib:/usr/local/lib:/usr/lib"
+[ $verbose = 1 ] || export WINEDEBUG="${WINEDEBUG:--all}"
+export WINEESYNC="${WINEESYNC:-0}"
+export MVK_CONFIG_LOG_LEVEL="${MVK_CONFIG_LOG_LEVEL:-1}"   # MoltenVK: errors only
+
+dxvk_install() {
+    [ -d "$WINEPREFIX/drive_c/windows/system32" ] || wine wineboot -u
+    local d
+    for d in $DXVK_DLLS; do
+        cp "$DXVK_DIST/x64/$d.dll" "$WINEPREFIX/drive_c/windows/system32/$d.dll"
+        cp "$DXVK_DIST/x32/$d.dll" "$WINEPREFIX/drive_c/windows/syswow64/$d.dll"
+    done
+    touch "$WINEPREFIX/.wrun-dxvk"
+}
+
+# Wine's GDI already finds macOS's fonts, but programs that read font files themselves (Unity's dynamic fonts)
+# look in C:\windows\Fonts, which Wine leaves empty; without these links, text that needs a fallback font
+# (e.g. Vietnamese letters beyond Latin-1) is dropped.
+MAC_FONTS="/System/Library/Fonts/Supplemental"
+CORE_FONTS="arial:Arial arialbd:Arial_Bold ariali:Arial_Italic arialbi:Arial_Bold_Italic ariblk:Arial_Black
+    tahoma:Tahoma tahomabd:Tahoma_Bold verdana:Verdana verdanab:Verdana_Bold verdanai:Verdana_Italic
+    verdanaz:Verdana_Bold_Italic times:Times_New_Roman timesbd:Times_New_Roman_Bold timesi:Times_New_Roman_Italic
+    timesbi:Times_New_Roman_Bold_Italic cour:Courier_New courbd:Courier_New_Bold couri:Courier_New_Italic
+    courbi:Courier_New_Bold_Italic georgia:Georgia georgiab:Georgia_Bold georgiai:Georgia_Italic
+    georgiaz:Georgia_Bold_Italic trebuc:Trebuchet_MS trebucbd:Trebuchet_MS_Bold trebucit:Trebuchet_MS_Italic
+    trebucbi:Trebuchet_MS_Bold_Italic micross:Microsoft_Sans_Serif"
+
+fonts_install() {
+    [ -d "$WINEPREFIX/drive_c/windows/Fonts" ] || wine wineboot -u
+    local entry name
+    for entry in $CORE_FONTS; do
+        name="${entry#*:}"; name="${name//_/ }"
+        [ -f "$MAC_FONTS/$name.ttf" ] || { echo "wrun: $MAC_FONTS/$name.ttf not found, skipped" >&2; continue; }
+        ln -sf "$MAC_FONTS/$name.ttf" "$WINEPREFIX/drive_c/windows/Fonts/${entry%%:*}.ttf"
+    done
+}
+
+case "$1" in
+    init) shift; wine wineboot -u; wineserver -w; echo "prefix ready: $WINEPREFIX"; exit 0 ;;
+    dxvk-install) dxvk_install; echo "DXVK installed in $WINEPREFIX"; exit 0 ;;
+    fonts-install) fonts_install; echo "fonts installed in $WINEPREFIX"; exit 0 ;;
+    shell) echo "Wine env for $WINEPREFIX (exit to leave)"; exec "${SHELL:-/bin/zsh}" -i ;;
+esac
+
+if [ $use_dxvk = 1 ]; then
+    [ -f "$WINEPREFIX/.wrun-dxvk" ] || dxvk_install
+    # Per-run overrides: the prefix itself keeps using wined3d unless --dxvk is given.
+    ov="$(echo $DXVK_DLLS | tr ' ' ',')=n,b"
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}$ov"
+fi
+
+exec wine "$@"

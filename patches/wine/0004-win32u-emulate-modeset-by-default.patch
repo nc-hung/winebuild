@@ -1,0 +1,33 @@
+win32u: Emulate display mode changes by default.
+
+A game's resolution setting (ChangeDisplaySettings with CDS_FULLSCREEN) went
+through winemac's real mode change. When the program wasn't the active app,
+winemac set the Mac display's mode without capturing the displays, so the new
+mode belonged to the whole login session and stayed after the game exited: the
+Mac was left at the game's resolution.
+
+Wine 11 can already emulate mode changes (the EmulateModeset value under
+HKCU\Software\Wine\X11 Driver, or AppDefaults\<app>.exe\X11 Driver). Windows
+programs then see the requested mode, fullscreen windows are scaled onto the
+screen, and the driver's ChangeDisplaySettings is never called, so the Mac
+display is never touched. This makes emulation the default; EmulateModeset=N
+turns real mode changes back on.
+
+Test: scripts/test-modeset.sh (demo/modeset.c).
+
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index eee8149..9b75c2a 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -166,7 +166,10 @@ static INT64 last_query_display_time;
+ static UINT64 monitor_update_serial;
+ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+-static BOOL emulate_modeset;
++/* On by default: winemac's real mode changes set the Mac display's mode for the whole login session when the
++ * program isn't the active app, so a game's resolution setting stayed on the Mac after the game exited.
++ * Emulated modes are scaled onto the screen and never touch it.  EmulateModeset=N turns real changes back on. */
++static BOOL emulate_modeset = TRUE;
+ BOOL decorated_mode = TRUE;
+ UINT64 thunk_lock_callback = 0;
+ 
