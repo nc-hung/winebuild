@@ -110,15 +110,48 @@ scripts/build-app.sh        # -> dist/Winebuild Manager.app (ad-hoc signed); --i
   Unpatched wineboot then crashes in `create_computer_name_keys` (`_invalid_parameter`, 0xc0000417), and a new
   prefix fails with `could not load kernel32.dll`. `patches/wine/0001` fixes this. Check with `hostname`.
 - **Fonts.** A fresh prefix has no core fonts. Some glyphs (e.g. Vietnamese capitals with stacked marks) render badly
-  in the substituted Courier New; pick a font with full coverage, such as Menlo.
+  in the substituted Courier New; pick a font with full coverage, such as Menlo. Wine's GDI finds macOS's fonts,
+  but programs that read font files themselves (Unity's dynamic fonts) look only in `C:\windows\Fonts`, and text
+  that needs a fallback (Vietnamese letters beyond Latin-1 in Truy Kích's Unity UI) is simply dropped.
+  `wrun fonts-install` symlinks macOS's Arial, Tahoma, Verdana, Times New Roman, Courier New, ... there.
+- **Display modes.** winemac's real mode change sets the Mac display's mode for the whole login session when the
+  program isn't the active app, so a game's resolution setting stayed on the Mac after the game exited.
+  `patches/wine/0004` makes win32u's `EmulateModeset` the default: programs see the mode they asked for, fullscreen
+  windows are scaled onto the screen, and the Mac display is never changed (`EmulateModeset`=`N` under
+  `HKCU\Software\Wine\X11 Driver` turns real changes back on). Test: `scripts/test-modeset.sh`.
 - **Invisible CEF popups.** CEF apps that draw off-screen into a layered window (`UpdateLayeredWindow`) can show a
   fully transparent window that still takes clicks. GPU compositing through ANGLE fails under both wined3d and DXVK
   (DXVK logs `VK_KHR_EXTERNAL_MEMORY_WIN32 not supported` for shared textures). Run without `--dxvk` and add
   `libegl,libglesv2=d` to `WINEDLLOVERRIDES`; the GPU process then fails and CEF falls back to software compositing.
   Seen with the Truy Kích launcher, whose `LiuseLoader.exe` rejects extra CEF switches such as `--disable-gpu`.
+- **D3D11-only games under a wined3d launcher.** Unity's D3D11 player (Truy Kích's
+  `SSJJ_BattleClient_Unity.exe`, 32-bit) fails with `d3d11: failed to create device and context (80004005)` /
+  `InitializeEngineGraphics failed` on wined3d. When the launcher must stay on wined3d (CEF, AIR's D3D9), give
+  only the game DXVK with `HKCU\Software\Wine\AppDefaults\<game>.exe\DllOverrides` `d3d11` and `dxgi` =
+  `native` (the prefix needs the DXVK DLLs: `wrun dxvk-install`). Don't add `d3d10core`: DXVK doesn't install it
+  in syswow64.
 - **Input methods.** With a macOS input method such as Vietnamese Telex active, keystrokes can go to Wine's IME
   composition box (a small white box, often at a window's bottom-left) instead of the text field. Switch the input
   source to ABC.
+- **Child windows from another process.** A window `SetParent`'ed into another process's window (the Truy Kích
+  lobby, Adobe AIR's `ApolloRuntimeContentWindow` inside `SSJJ_MainWnd`) draws nothing in stock Wine.
+  `patches/wine/0003` gives it its own Mac window above the parent's; `scripts/test-xproc-child.sh` is the
+  two-process regression test (GDI, one-context and two-context OpenGL children). In winemac, find the window that owns the Mac window
+  with `get_cocoa_toplevel()`, not `GA_ROOT`: GA_ROOT is the other process's window, and GL/Vulkan client
+  surfaces (wined3d, so AIR's D3D9 lobby) attached there leave the child white. A window can also have several GL
+  drawables (one per context made current on it; wined3d in AIR makes two), so the drawable that swaps must show
+  its own view (`macdrv_client_surface_show`), or frames go to a hidden view and the window is white even when
+  it is a normal top-level window. Mouse input must also name the `get_cocoa_toplevel()` window: the server
+  asks the named window's thread to set the cursor, and with GA_ROOT the other process set its own (often no)
+  cursor, so the pointer vanished over the lobby. A process whose only Mac windows are such children becomes an
+  accessory app (`transformProcessToAccessory`), so AIR's lobby process adds no Dock icon of its own. AIR first
+  shows an ordinary preloader window and keeps a zero-size one, so a regular app goes back to accessory once only
+  such children are shown, and zero-size windows don't make it regular again (test: `splash` mode). A regular
+  process left with no window shown (a launcher hiding itself, explorer.exe) becomes accessory after 2 s
+  (`transformProcessToAccessoryIfNothingShown`; test: `hide` mode). Don't mark these Mac windows
+  `Transient`, since Stage Manager hides transient windows of background apps. The test reports PARTIAL when
+  Stage Manager shows windows as scaled thumbnails (positions unchecked) or when the terminal lacks Screen
+  Recording permission (the GL child's colour unchecked).
 
 ## Conventions for changes
 

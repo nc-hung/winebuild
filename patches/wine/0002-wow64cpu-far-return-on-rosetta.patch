@@ -1,0 +1,100 @@
+wow64cpu: Switch between 32- and 64-bit code with far returns instead of far jumps.
+
+Under Rosetta 2, a far jmp that follows a write into a page holding translated code
+can run its target in the wrong mode, in both directions: syscall_32to64 then runs
+as 32-bit code and crashes (seen with Adobe AIR 3.6, whose ATL window thunks are
+rewritten in place). Far returns (lret/lretq) are not affected.
+Test: demo/flushic32.c, demo/farjmp32.c.
+
+diff --git a/dlls/wow64cpu/cpu.c b/dlls/wow64cpu/cpu.c
+index 4a49989..1cb4584 100644
+--- a/dlls/wow64cpu/cpu.c
++++ b/dlls/wow64cpu/cpu.c
+@@ -32,13 +32,16 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(wow);
+ 
+ #pragma pack(push,1)
++/* push $cs64; push $addr; lret. After a write into a page that holds translated code (self-modifying code such as
++ * ATL window thunks, or WriteProcessMemory on the own process), Rosetta 2 can run the target of a far jmp in the
++ * wrong mode, in both directions. Far returns switch modes correctly, so they are used both ways here. */
+ struct thunk_32to64
+ {
+-    BYTE  ljmp;   /* jump far, absolute indirect */
+-    BYTE  modrm;  /* address=disp32, opcode=5 */
+-    DWORD op;
++    BYTE  push_cs;   /* push imm32 */
++    DWORD cs;
++    BYTE  push_addr; /* push imm32 */
+     DWORD addr;
+-    WORD  cs;
++    BYTE  lret;      /* return far */
+ };
+ struct thunk_opcodes
+ {
+@@ -205,13 +208,13 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
+                    "movl 0xb4(%r13),%ebp\n\t"   /* context->Ebp */
+                    "btrl $0,-4(%r13)\n\t"       /* cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE */
+                    "jc .Lsyscall_32to64_return\n\t"
+-                   "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
+-                   "movl %edx,(%rsp)\n\t"
+-                   "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
+-                   "movl %edx,4(%rsp)\n\t"
+                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                    "xchgq %r14,%rsp\n\t"
+-                   "ljmp *(%r14)\n"
++                   "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
++                   "pushq %rdx\n\t"
++                   "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
++                   "pushq %rdx\n\t"
++                   "lretq\n"
+                    ".Lsyscall_32to64_return:\n\t"
+                    "movq %rsp,%r14\n\t"
+                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
+@@ -265,13 +268,13 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
+                    "movl %eax,0xb0(%r13)\n\t"   /* context->Eax */
+                    "btrl $0,-4(%r13)\n\t"       /* cpu->Flags & WOW64_CPURESERVED_FLAG_RESET_STATE */
+                    "jc .Lsyscall_32to64_return\n\t"
+-                   "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
+-                   "movl %edx,(%rsp)\n\t"
+-                   "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
+-                   "movl %edx,4(%rsp)\n\t"
+                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                    "xchgq %r14,%rsp\n\t"
+-                   "ljmp *(%r14)" )
++                   "movl 0xbc(%r13),%edx\n\t"   /* context->SegCs */
++                   "pushq %rdx\n\t"
++                   "movl 0xb8(%r13),%edx\n\t"   /* context->Eip */
++                   "pushq %rdx\n\t"
++                   "lretq" )
+ 
+ 
+ /**********************************************************************
+@@ -336,17 +339,17 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
+     cs32_sel = context_i386.SegCs;
+     ss32_sel = context_i386.SegSs;
+ 
+-    thunk->syscall_thunk.ljmp  = 0xff;
+-    thunk->syscall_thunk.modrm = 0x2d;
+-    thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
+-    thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
+-    thunk->syscall_thunk.cs    = cs64_sel;
+-
+-    thunk->unix_thunk.ljmp  = 0xff;
+-    thunk->unix_thunk.modrm = 0x2d;
+-    thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
+-    thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
+-    thunk->unix_thunk.cs    = cs64_sel;
++    thunk->syscall_thunk.push_cs   = 0x68;
++    thunk->syscall_thunk.cs        = cs64_sel;
++    thunk->syscall_thunk.push_addr = 0x68;
++    thunk->syscall_thunk.addr      = PtrToUlong( syscall_32to64 );
++    thunk->syscall_thunk.lret      = 0xcb;
++
++    thunk->unix_thunk.push_cs   = 0x68;
++    thunk->unix_thunk.cs        = cs64_sel;
++    thunk->unix_thunk.push_addr = 0x68;
++    thunk->unix_thunk.addr      = PtrToUlong( unix_call_32to64 );
++    thunk->unix_thunk.lret      = 0xcb;
+ 
+     NtProtectVirtualMemory( GetCurrentProcess(), (void **)&thunk, &size, PAGE_EXECUTE_READ, &old_prot );
+     return STATUS_SUCCESS;

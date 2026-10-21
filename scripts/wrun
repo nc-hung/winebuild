@@ -4,6 +4,7 @@
 #   wrun [-p PREFIX] [--dxvk] [--hud SPEC] [--] PROGRAM [ARGS...]
 #   wrun [-p PREFIX] init            create/update the prefix (wineboot -u)
 #   wrun [-p PREFIX] dxvk-install    copy DXVK dlls into the prefix (done automatically by --dxvk)
+#   wrun [-p PREFIX] fonts-install   link macOS's Arial, Tahoma, Times New Roman, ... into C:\windows\Fonts
 #   wrun [-p PREFIX] shell           open a shell with the Wine environment set
 #
 #   -p, --prefix DIR  WINEPREFIX (default: $WRUN_PREFIX or ~/winebuild/prefixes/default)
@@ -31,12 +32,12 @@ while [ $# -gt 0 ]; do
         --dxvk) use_dxvk=1; shift ;;
         --hud) use_dxvk=1; export DXVK_HUD="$2"; shift 2 ;;
         -v) verbose=1; shift ;;
-        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --) shift; break ;;
         *) break ;;
     esac
 done
-[ $# -gt 0 ] || { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ $# -gt 0 ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 [ -x "$WINE_DIST/bin/wine" ] || { echo "wrun: $WINE_DIST/bin/wine not found; run build-wine.sh" >&2; exit 1; }
 
 export WINEPREFIX="$prefix"
@@ -58,9 +59,32 @@ dxvk_install() {
     touch "$WINEPREFIX/.wrun-dxvk"
 }
 
+# Wine's GDI already finds macOS's fonts, but programs that read font files themselves (Unity's dynamic fonts)
+# look in C:\windows\Fonts, which Wine leaves empty; without these links, text that needs a fallback font
+# (e.g. Vietnamese letters beyond Latin-1) is dropped.
+MAC_FONTS="/System/Library/Fonts/Supplemental"
+CORE_FONTS="arial:Arial arialbd:Arial_Bold ariali:Arial_Italic arialbi:Arial_Bold_Italic ariblk:Arial_Black
+    tahoma:Tahoma tahomabd:Tahoma_Bold verdana:Verdana verdanab:Verdana_Bold verdanai:Verdana_Italic
+    verdanaz:Verdana_Bold_Italic times:Times_New_Roman timesbd:Times_New_Roman_Bold timesi:Times_New_Roman_Italic
+    timesbi:Times_New_Roman_Bold_Italic cour:Courier_New courbd:Courier_New_Bold couri:Courier_New_Italic
+    courbi:Courier_New_Bold_Italic georgia:Georgia georgiab:Georgia_Bold georgiai:Georgia_Italic
+    georgiaz:Georgia_Bold_Italic trebuc:Trebuchet_MS trebucbd:Trebuchet_MS_Bold trebucit:Trebuchet_MS_Italic
+    trebucbi:Trebuchet_MS_Bold_Italic micross:Microsoft_Sans_Serif"
+
+fonts_install() {
+    [ -d "$WINEPREFIX/drive_c/windows/Fonts" ] || wine wineboot -u
+    local entry name
+    for entry in $CORE_FONTS; do
+        name="${entry#*:}"; name="${name//_/ }"
+        [ -f "$MAC_FONTS/$name.ttf" ] || { echo "wrun: $MAC_FONTS/$name.ttf not found, skipped" >&2; continue; }
+        ln -sf "$MAC_FONTS/$name.ttf" "$WINEPREFIX/drive_c/windows/Fonts/${entry%%:*}.ttf"
+    done
+}
+
 case "$1" in
     init) shift; wine wineboot -u; wineserver -w; echo "prefix ready: $WINEPREFIX"; exit 0 ;;
     dxvk-install) dxvk_install; echo "DXVK installed in $WINEPREFIX"; exit 0 ;;
+    fonts-install) fonts_install; echo "fonts installed in $WINEPREFIX"; exit 0 ;;
     shell) echo "Wine env for $WINEPREFIX (exit to leave)"; exec "${SHELL:-/bin/zsh}" -i ;;
 esac
 
